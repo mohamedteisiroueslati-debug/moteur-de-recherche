@@ -1,5 +1,7 @@
 package com.recherche.backend.service;
 
+import com.mongodb.MongoNamespace;
+import com.mongodb.client.model.RenameCollectionOptions;
 import com.recherche.backend.indexation.AnalyseurTexte;
 import com.recherche.backend.model.PagePdf;
 import com.recherche.backend.model.Posting;
@@ -7,10 +9,11 @@ import com.recherche.backend.model.Stats;
 import com.recherche.backend.model.Vocabulaire;
 import com.recherche.backend.repository.DocPdfRepository;
 import com.recherche.backend.repository.PagePdfRepository;
-import com.recherche.backend.repository.PostingRepository;
 import com.recherche.backend.repository.StatsRepository;
-import com.recherche.backend.repository.VocabulaireRepository;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.index.IndexOperations;
+import org.springframework.data.mongodb.core.index.IndexResolver;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -35,13 +38,13 @@ import java.util.Map;
 public class IndexationService {
 
     private static final int TAILLE_LOT = 10_000;   // insertion en base par lots
+    private static final String SUFFIXE_TMP = "_tmp";
 
     private final AnalyseurTexte analyseur;
     private final DocPdfRepository docRepo;
     private final PagePdfRepository pageRepo;
-    private final VocabulaireRepository vocabulaireRepo;
-    private final PostingRepository postingRepo;
     private final StatsRepository statsRepo;
+    private final MongoTemplate mongo;
 
     /** Reconstruit tout l'index. Les pages sont chargées en mémoire (suffisant pour un corpus de cours). */
     public synchronized Stats reconstruire() {
@@ -87,11 +90,15 @@ public class IndexationService {
             postings.addAll(e.getValue());
         }
 
-        // ⑦ stockage : on remplace l'ancien index
-        postingRepo.deleteAll();
-        vocabulaireRepo.deleteAll();
-        enregistrerParLots(vocabulaire, vocabulaireRepo::saveAll);
-        enregistrerParLots(postings, postingRepo::saveAll);
+        // ⑦ stockage : le nouvel index est écrit à côté de l'ancien, puis échangé.
+        //    Pendant la reconstruction, les recherches utilisent toujours l'ancien index ;
+        //    en cas d'erreur, l'ancien index reste intact.
+        String vocabulaireTmp = preparerCollectionTemporaire(Vocabulaire.class);
+        String postingsTmp = preparerCollectionTemporaire(Posting.class);
+        enregistrerParLots(vocabulaire, lot -> mongo.insert(lot, vocabulaireTmp));
+        enregistrerParLots(postings, lot -> mongo.insert(lot, postingsTmp));
+        remplacerCollection(vocabulaireTmp, Vocabulaire.class);
+        remplacerCollection(postingsTmp, Posting.class);
         enregistrerParLots(pages, pageRepo::saveAll);          // met à jour nombreTermes
 
         Stats stats = new Stats();
@@ -114,6 +121,27 @@ public class IndexationService {
 
     public Stats stats() {
         return statsRepo.findById(Stats.ID_GLOBAL).orElse(null);
+    }
+
+    /**
+     * Crée une collection temporaire vide (ex. "postings_tmp") avec les mêmes index que la
+     * collection finale. Une éventuelle collection laissée par une reconstruction interrompue est supprimée.
+     */
+    private String preparerCollectionTemporaire(Class<?> type) {
+        String tmp = mongo.getCollectionName(type) + SUFFIXE_TMP;
+        mongo.dropCollection(tmp);
+        mongo.createCollection(tmp);
+        IndexOperations indexOps = mongo.indexOps(tmp);
+        IndexResolver.create(mongo.getConverter().getMappingContext())
+                .resolveIndexFor(type)
+                .forEach(indexOps::createIndex);
+        return tmp;
+    }
+
+    /** Renomme la collection temporaire en collection finale ; l'ancienne est supprimée (opération atomique). */
+    private void remplacerCollection(String tmp, Class<?> type) {
+        MongoNamespace cible = new MongoNamespace(mongo.getDb().getName(), mongo.getCollectionName(type));
+        mongo.getCollection(tmp).renameCollection(cible, new RenameCollectionOptions().dropTarget(true));
     }
 
     private static <T> void enregistrerParLots(List<T> elements, java.util.function.Consumer<List<T>> sauver) {
