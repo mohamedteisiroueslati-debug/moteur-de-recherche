@@ -18,4 +18,7 @@ public class PagePdf {
     private String nomFichier;
     private int numeroPage;
     private String contenu;             // texte extrait de la page
+
+    private int nombreTermes;           // nombre de termes après analyse (longueur de la page),
+                                        // utilisé plus tard pour normaliser les scores TF-IDF
 }
